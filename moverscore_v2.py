@@ -11,6 +11,7 @@ from itertools import chain
 from collections import defaultdict, Counter
 from multiprocessing import Pool
 from functools import partial
+from typing import List, Union, Iterable
 
 
 from transformers import AutoTokenizer, AutoModel
@@ -19,14 +20,28 @@ if os.environ.get('MOVERSCORE_MODEL'):
     model_name = os.environ.get('MOVERSCORE_MODEL')
 else:
     model_name = 'distilbert-base-uncased'
-tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=True)
-model = AutoModel.from_pretrained(model_name, output_hidden_states=True, output_attentions=True)
-model.eval()
 
+device = os.environ.get('DEVICE', "cpu")
+model_max_length = 512
+
+tokenizer = None
+model = None
+
+def init_model():
+    print("\nInitializing models for MoverScore")
+
+    global tokenizer
+    global model
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, do_lower_case=True)
+    #tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name, output_hidden_states=True, output_attentions=True)
+    model.to(device)
+    model.eval()
 
 def truncate(tokens):
-    if len(tokens) > tokenizer.model_max_length - 2:
-        tokens = tokens[0:(tokenizer.model_max_length - 2)]
+    if len(tokens) > model_max_length - 2:
+        tokens = tokens[0:(model_max_length - 2)]
     return tokens
 
 def process(a):
@@ -61,11 +76,11 @@ def padding(arr, pad_token, dtype=torch.long):
 def bert_encode(model, x, attention_mask):
     model.eval()
     with torch.no_grad():
-        result = model(x, attention_mask = attention_mask)
+        result = model(x.to(device), attention_mask = attention_mask.to(device))
     if model_name == 'distilbert-base-uncased':
-        return result[1] 
+        return result[1]
     else:
-        return result[2] 
+        return result[2]
 
 #with open('stopwords.txt', 'r', encoding='utf-8') as f:
 #    stop_words = set(f.read().strip().split(' '))
@@ -103,13 +118,15 @@ def get_bert_embedding(all_sens, model, tokenizer, idf_dict,
             embeddings.append(batch_embedding)
             del batch_embedding
 
-    total_embedding = torch.cat(embeddings, dim=-3)
+    total_embedding = torch.cat(embeddings, dim=-3).cpu()
     return total_embedding, lens, mask, padded_idf, tokens
 
 def _safe_divide(numerator, denominator):
     return numerator / (denominator + 1e-30)
 
 def batched_cdist_l2(x1, x2):
+    x1 = x1.to(device)
+    x2 = x2.to(device)
     x1_norm = x1.pow(2).sum(dim=-1, keepdim=True)
     x2_norm = x2.pow(2).sum(dim=-1, keepdim=True)
     res = torch.baddbmm(
@@ -117,10 +134,14 @@ def batched_cdist_l2(x1, x2):
         x1,
         x2.transpose(-2, -1),
         alpha=-2
-    ).add_(x1_norm).clamp_min_(1e-30).sqrt_()
+    ).add_(x1_norm).clamp_min_(1e-30).sqrt_().cpu()
     return res
 
+punctuation_set = set(string.punctuation)
 def word_mover_score(refs, hyps, idf_dict_ref, idf_dict_hyp, stop_words=[], n_gram=1, remove_subwords = True, batch_size=256):
+    if model is None:
+        init_model()
+
     preds = []
     for batch_start in range(0, len(refs), batch_size):
         batch_refs = refs[batch_start:batch_start+batch_size]
@@ -134,12 +155,22 @@ def word_mover_score(refs, hyps, idf_dict_ref, idf_dict_hyp, stop_words=[], n_gr
         
         batch_size = len(ref_tokens)
         for i in range(batch_size):  
-            ref_ids = [k for k, w in enumerate(ref_tokens[i]) 
-                                if w in stop_words or '##' in w 
-                                or w in set(string.punctuation)]
-            hyp_ids = [k for k, w in enumerate(hyp_tokens[i]) 
-                                if w in stop_words or '##' in w
-                                or w in set(string.punctuation)]
+            ref_ids = [
+                k for k, w in enumerate(ref_tokens[i]) 
+                if any([
+                    w in stop_words,
+                    w in punctuation_set,
+                    '##' in w,
+                ])
+            ]
+            hyp_ids = [
+                k for k, w in enumerate(hyp_tokens[i]) 
+                if any([
+                    w in stop_words,
+                    w in punctuation_set,
+                    '##' in w,
+                ])
+            ]
           
             ref_embedding[i, ref_ids,:] = 0                        
             hyp_embedding[i, hyp_ids,:] = 0
@@ -169,6 +200,29 @@ def word_mover_score(refs, hyps, idf_dict_ref, idf_dict_hyp, stop_words=[], n_gr
             preds.append(score)
 
     return preds
+
+def sentence_score(hypothesis: str, references: List[str], stop_words=None, n_gram=1, remove_subwords=False):
+    if model is None:
+        init_model()
+
+    idf_dict_hyp = defaultdict(lambda: 1.)
+    idf_dict_ref = defaultdict(lambda: 1.)
+    
+    hypothesis = [hypothesis] * len(references)
+    
+    sentence_score = 0 
+    scores = word_mover_score(
+        references, 
+        hypothesis, 
+        idf_dict_ref, 
+        idf_dict_hyp, 
+        stop_words=[] if stop_words is None else stop_words, 
+        n_gram=n_gram, 
+        remove_subwords=remove_subwords
+    )
+    sentence_score = np.mean(scores)
+            
+    return sentence_score
 
 import matplotlib.pyplot as plt
 

@@ -256,3 +256,24 @@ def word_mover_score(refs, hyps, idf_dict_ref, idf_dict_hyp, stop_words=[], n_gr
             score = 1 - emd(c1, c2, distance_matrix.double().cpu().numpy())
             preds.append(score)
     return preds
+
+def sentence_score(hypothesis: str, references: List[str], stop_words=None, n_gram=1, remove_subwords=False):
+    
+    idf_dict_hyp = defaultdict(lambda: 1.)
+    idf_dict_ref = defaultdict(lambda: 1.)
+    
+    hypothesis = [hypothesis] * len(references)
+    
+    sentence_score = 0 
+    scores = word_mover_score(
+        references, 
+        hypothesis, 
+        idf_dict_ref, 
+        idf_dict_hyp, 
+        stop_words=[] if stop_words is None else stop_words, 
+        n_gram=n_gram, 
+        remove_subwords=remove_subwords
+    )
+    sentence_score = np.mean(scores)
+            
+    return sentence_score
